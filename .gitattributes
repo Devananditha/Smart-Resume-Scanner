@@ -1,0 +1,11 @@
+# Normalize line endings to LF for all text files on commit.
+# Windows checkouts will still use CRLF locally.
+* text=auto eol=lf
+
+# Explicitly treat Python and config files as text
+*.py    text eol=lf
+*.txt   text eol=lf
+*.ini   text eol=lf
+*.json  text eol=lf
+*.md    text eol=lf
+*.env*  text eol=lf

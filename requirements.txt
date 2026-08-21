@@ -1,0 +1,12 @@
+fastapi
+uvicorn[standard]
+python-multipart
+pdfplumber
+motor
+pydantic-settings
+google-genai
+
+# ── Testing ───────────────────────────────────────────────────────────────────
+pytest
+pytest-asyncio
+httpx
