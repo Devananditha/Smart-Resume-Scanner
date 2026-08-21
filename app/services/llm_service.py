@@ -4,10 +4,10 @@ app/services/llm_service.py
 Two-pass Gemini LLM pipeline for the Smart Resume Screener.
 
 Pass 1 — Structured extraction
-    Raw resume text  →  ParsedResume  (schema-constrained JSON output)
+    Raw resume text  →  ParsedResume  (JSON mode + Pydantic validation)
 
 Pass 2 — Semantic evaluation
-    ParsedResume + job description  →  EvaluationResult  (schema-constrained)
+    ParsedResume + job description  →  EvaluationResult  (JSON mode + Pydantic)
 
 Design decisions
 ────────────────
@@ -18,10 +18,13 @@ Design decisions
   is offloaded to a thread-pool executor via `asyncio.to_thread` to avoid
   stalling the FastAPI event loop during network I/O.
 
-* Schema-constrained output (`response_mime_type="application/json"` +
-  `response_schema=<PydanticModel>`) instructs Gemini to emit JSON that
-  conforms to the Pydantic model's JSON Schema.  The SDK handles schema
-  serialisation internally.
+* JSON output is enforced via `response_mime_type="application/json"` combined
+  with an explicit JSON structure description in the system prompt.
+  `response_schema=<PydanticModel>` is intentionally NOT used: in google-genai
+  SDK 2.x, passing a Pydantic model as response_schema activates Automatic
+  Function Calling (AFC), which hangs or errors on `models.generate_content`.
+  Instead, the response text is validated by `model_validate_json()` which
+  gives identical Pydantic enforcement without SDK interference.
 
 * All API and JSON-parse failures are caught and re-raised as HTTP 502 so
   the router always returns a well-formed error to the client.
@@ -30,7 +33,6 @@ Design decisions
 from __future__ import annotations
 
 import asyncio
-import json
 
 from fastapi import HTTPException
 from google import genai
@@ -45,8 +47,51 @@ from app.models.resume import EvaluationResult, ParsedResume
 
 client = genai.Client(api_key=settings.gemini_api_key)
 
-# Model identifier — change here to switch Gemini versions project-wide.
-_MODEL = "gemini-2.5-flash"
+# gemini-3.6-flash: current generation model available to new API keys.
+# gemini-2.5-flash returns 404 NOT_FOUND for accounts created after its
+# deprecation window.
+_MODEL = "gemini-3.6-flash"
+
+# ---------------------------------------------------------------------------
+# JSON schema hints embedded in prompts
+# (used instead of response_schema= to avoid AFC activation in SDK 2.x)
+# ---------------------------------------------------------------------------
+
+_PARSED_RESUME_SCHEMA = """
+{
+  "full_name": "string",
+  "email": "string or null",
+  "phone": "string or null",
+  "skills": ["string"],
+  "experience": [
+    {
+      "company": "string",
+      "role": "string",
+      "duration": "string or null",
+      "highlights": ["string"]
+    }
+  ],
+  "education": [
+    {
+      "institution": "string",
+      "degree": "string",
+      "graduation_year": "string or null",
+      "gpa": "string or null"
+    }
+  ],
+  "summary": "string or null"
+}
+"""
+
+_EVALUATION_RESULT_SCHEMA = """
+{
+  "match_score": float between 1.0 and 10.0,
+  "justification": "string",
+  "matched_skills": ["string"],
+  "missing_skills": ["string"],
+  "recommendation": "Strong Match" | "Potential Match" | "Not a Fit"
+}
+"""
 
 # ---------------------------------------------------------------------------
 # Internal helpers
@@ -109,15 +154,16 @@ async def extract_structured_resume(raw_text: str) -> ParsedResume:
     """
     system_instruction = (
         "You are an expert HR parser. "
-        "Extract the following raw resume text into the requested JSON schema. "
-        "Be highly accurate. If a field is missing, leave it empty."
+        "Extract the following raw resume text into a JSON object that strictly "
+        "matches this schema (omit missing optional fields or set them to null):\n"
+        f"{_PARSED_RESUME_SCHEMA}\n"
+        "Return ONLY valid JSON — no markdown, no explanation."
     )
 
     config = types.GenerateContentConfig(
         system_instruction=system_instruction,
         response_mime_type="application/json",
-        response_schema=ParsedResume,
-        temperature=0.1,   # low temperature for deterministic extraction
+        temperature=0.1,
     )
 
     try:
@@ -159,10 +205,12 @@ async def evaluate_candidate_fit(
     """
     system_instruction = (
         "Compare the following resume with this job description "
-        "and rate fit on 1-10 with justification."
+        "and rate fit on 1-10 with justification. "
+        "Return a JSON object that strictly matches this schema:\n"
+        f"{_EVALUATION_RESULT_SCHEMA}\n"
+        "Return ONLY valid JSON — no markdown, no explanation."
     )
 
-    # Build the user message from both inputs so the model sees both in context.
     user_message = (
         f"RESUME (JSON):\n{parsed_resume.model_dump_json(indent=2)}\n\n"
         f"JOB DESCRIPTION:\n{job_description}"
@@ -171,7 +219,6 @@ async def evaluate_candidate_fit(
     config = types.GenerateContentConfig(
         system_instruction=system_instruction,
         response_mime_type="application/json",
-        response_schema=EvaluationResult,
         temperature=0.2,
     )
 
