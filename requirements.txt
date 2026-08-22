@@ -5,6 +5,7 @@ pdfplumber
 motor
 pydantic-settings
 google-genai
+groq
 
 # ── Testing ───────────────────────────────────────────────────────────────────
 pytest

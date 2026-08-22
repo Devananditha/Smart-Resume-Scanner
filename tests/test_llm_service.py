@@ -5,14 +5,17 @@ Unit tests for app/services/llm_service.py.
 
 Strategy
 ────────
-* The live Gemini API is never called.  All tests mock `_call_generate` —
-  the named helper that wraps `client.models.generate_content` — so asyncio,
-  thread-pool offloading, and Pydantic validation are all exercised while the
-  network layer is fully isolated.
+* The live Gemini and Groq APIs are never called.  All tests mock `_call_gemini`
+  and `_call_groq` — the named helpers that wrap the respective SDK clients —
+  so asyncio, thread-pool offloading, and Pydantic validation are all exercised
+  while the network layer is fully isolated.
 
-* Mocking `_call_generate` (rather than `client.models.generate_content`
-  directly) is simpler and more robust: it avoids having to simulate the full
-  `GenerateContentResponse` object and keeps tests decoupled from SDK internals.
+* Tests cover:
+  1. Happy-path Gemini success on both functions.
+  2. Gemini API failure → Groq fallback activates and succeeds.
+  3. Both Gemini and Groq fail → HTTPException 502 is raised.
+  4. Invalid JSON from either provider → HTTPException 502 is raised.
+  5. Payload forwarding (raw_text, user_message) is verified via mock call args.
 
 * All async test functions are collected automatically by pytest-asyncio
   (asyncio_mode = auto in pytest.ini).
@@ -101,11 +104,11 @@ class TestExtractStructuredResume:
         self, valid_parsed_resume_json: str
     ) -> None:
         """
-        When _call_generate returns a valid ParsedResume JSON string, the
+        When _call_gemini returns a valid ParsedResume JSON string, the
         function must return a correctly populated ParsedResume instance.
         """
         with patch(
-            "app.services.llm_service._call_generate",
+            "app.services.llm_service._call_gemini",
             return_value=valid_parsed_resume_json,
         ):
             result = await extract_structured_resume("Alice Chen - Python Engineer...")
@@ -123,30 +126,62 @@ class TestExtractStructuredResume:
     async def test_extract_structured_resume_passes_raw_text(self) -> None:
         """
         The raw_text argument must be forwarded as the `contents` parameter
-        to _call_generate (verified by inspecting mock call args).
+        to _call_gemini (verified by inspecting mock call args).
         """
         raw = "Jane Doe — Senior SWE — jane@example.com"
         minimal_json = json.dumps({"full_name": "Jane Doe"})
 
         with patch(
-            "app.services.llm_service._call_generate",
+            "app.services.llm_service._call_gemini",
             return_value=minimal_json,
         ) as mock_call:
             await extract_structured_resume(raw)
 
-        # First positional arg to _call_generate is `contents`
+        # First positional arg to _call_gemini is `contents`
         call_args = mock_call.call_args
         assert call_args.args[0] == raw
 
     @pytest.mark.asyncio
-    async def test_extract_structured_resume_api_failure_raises_502(self) -> None:
+    async def test_extract_structured_resume_gemini_fails_groq_succeeds(
+        self, valid_parsed_resume_json: str
+    ) -> None:
         """
-        Any exception from _call_generate must be caught and re-raised as
-        HTTPException 502 — never propagated as a raw SDK error.
+        When Gemini raises an exception, the Groq fallback must be triggered
+        and return a valid ParsedResume if it succeeds.
         """
-        with patch(
-            "app.services.llm_service._call_generate",
-            side_effect=Exception("Simulated Gemini API timeout"),
+        with (
+            patch(
+                "app.services.llm_service._call_gemini",
+                side_effect=Exception("503 Gemini overloaded"),
+            ),
+            patch(
+                "app.services.llm_service._call_groq",
+                return_value=valid_parsed_resume_json,
+            ) as mock_groq,
+        ):
+            result = await extract_structured_resume("Some resume text")
+
+        assert isinstance(result, ParsedResume)
+        assert result.full_name == "Alice Chen"
+        # Verify the Groq fallback was actually invoked
+        mock_groq.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_extract_structured_resume_both_providers_fail_raises_502(
+        self,
+    ) -> None:
+        """
+        If both Gemini and Groq fail, HTTPException 502 must be raised.
+        """
+        with (
+            patch(
+                "app.services.llm_service._call_gemini",
+                side_effect=Exception("Gemini rate limit"),
+            ),
+            patch(
+                "app.services.llm_service._call_groq",
+                side_effect=Exception("Groq timeout"),
+            ),
         ):
             with pytest.raises(HTTPException) as exc_info:
                 await extract_structured_resume("Some resume text")
@@ -160,9 +195,15 @@ class TestExtractStructuredResume:
         If the model returns malformed JSON, model_validate_json raises a
         ValidationError which must be wrapped as HTTPException 502.
         """
-        with patch(
-            "app.services.llm_service._call_generate",
-            return_value="{not valid json !!!}",
+        with (
+            patch(
+                "app.services.llm_service._call_gemini",
+                return_value="{not valid json !!!}",
+            ),
+            patch(
+                "app.services.llm_service._call_groq",
+                return_value="{also not valid json}",
+            ),
         ):
             with pytest.raises(HTTPException) as exc_info:
                 await extract_structured_resume("Some resume text")
@@ -184,13 +225,13 @@ class TestEvaluateCandidateFit:
         valid_evaluation_result_json: str,
     ) -> None:
         """
-        When _call_generate returns a valid EvaluationResult JSON string, the
+        When _call_gemini returns a valid EvaluationResult JSON string, the
         function must return a correctly populated EvaluationResult instance.
         """
         job_desc = "Looking for a Python backend engineer with FastAPI experience."
 
         with patch(
-            "app.services.llm_service._call_generate",
+            "app.services.llm_service._call_gemini",
             return_value=valid_evaluation_result_json,
         ):
             result = await evaluate_candidate_fit(sample_parsed_resume, job_desc)
@@ -218,7 +259,7 @@ class TestEvaluateCandidateFit:
                 }
             )
             with patch(
-                "app.services.llm_service._call_generate",
+                "app.services.llm_service._call_gemini",
                 return_value=boundary_json,
             ):
                 result = await evaluate_candidate_fit(sample_parsed_resume, "JD text")
@@ -230,13 +271,13 @@ class TestEvaluateCandidateFit:
         self, sample_parsed_resume: ParsedResume, valid_evaluation_result_json: str
     ) -> None:
         """
-        The user message passed to _call_generate must include both the
+        The user message passed to _call_gemini must include both the
         serialised resume JSON and the job description text.
         """
         job_desc = "Unique job description marker XYZ-9999"
 
         with patch(
-            "app.services.llm_service._call_generate",
+            "app.services.llm_service._call_gemini",
             return_value=valid_evaluation_result_json,
         ) as mock_call:
             await evaluate_candidate_fit(sample_parsed_resume, job_desc)
@@ -246,16 +287,48 @@ class TestEvaluateCandidateFit:
         assert "XYZ-9999" in user_message            # job description present
 
     @pytest.mark.asyncio
-    async def test_llm_service_handles_api_failure(
+    async def test_evaluate_candidate_fit_gemini_fails_groq_succeeds(
+        self,
+        sample_parsed_resume: ParsedResume,
+        valid_evaluation_result_json: str,
+    ) -> None:
+        """
+        When Gemini raises an exception, the Groq fallback must be triggered
+        and return a valid EvaluationResult if it succeeds.
+        """
+        with (
+            patch(
+                "app.services.llm_service._call_gemini",
+                side_effect=Exception("429 Gemini rate limit"),
+            ),
+            patch(
+                "app.services.llm_service._call_groq",
+                return_value=valid_evaluation_result_json,
+            ) as mock_groq,
+        ):
+            result = await evaluate_candidate_fit(sample_parsed_resume, "Some JD")
+
+        assert isinstance(result, EvaluationResult)
+        assert result.match_score == 8.5
+        mock_groq.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_evaluate_candidate_fit_both_providers_fail_raises_502(
         self, sample_parsed_resume: ParsedResume
     ) -> None:
         """
-        Any exception from _call_generate during evaluation must be caught
-        and re-raised as HTTPException 502.
+        If both Gemini and Groq fail during evaluation, HTTPException 502
+        must be raised.
         """
-        with patch(
-            "app.services.llm_service._call_generate",
-            side_effect=Exception("Quota exceeded"),
+        with (
+            patch(
+                "app.services.llm_service._call_gemini",
+                side_effect=Exception("Quota exceeded"),
+            ),
+            patch(
+                "app.services.llm_service._call_groq",
+                side_effect=Exception("Groq error"),
+            ),
         ):
             with pytest.raises(HTTPException) as exc_info:
                 await evaluate_candidate_fit(sample_parsed_resume, "Some JD")
@@ -268,9 +341,15 @@ class TestEvaluateCandidateFit:
         self, sample_parsed_resume: ParsedResume
     ) -> None:
         """Malformed JSON response from the model must surface as 502."""
-        with patch(
-            "app.services.llm_service._call_generate",
-            return_value="<html>Error page</html>",
+        with (
+            patch(
+                "app.services.llm_service._call_gemini",
+                return_value="<html>Error page</html>",
+            ),
+            patch(
+                "app.services.llm_service._call_groq",
+                return_value="<html>Groq error page</html>",
+            ),
         ):
             with pytest.raises(HTTPException) as exc_info:
                 await evaluate_candidate_fit(sample_parsed_resume, "JD")

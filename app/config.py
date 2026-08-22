@@ -22,6 +22,9 @@ class Settings(BaseSettings):
     # ── Google Gemini ────────────────────────────────────────────────────────
     gemini_api_key: str
 
+    # ── Groq (fallback LLM provider) ─────────────────────────────────────────
+    groq_api_key: str = ""
+
     # ── MongoDB ──────────────────────────────────────────────────────────────
     mongodb_url: str = "mongodb://localhost:27017"
     database_name: str = "resume_screener"
