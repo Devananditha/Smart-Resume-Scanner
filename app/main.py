@@ -19,7 +19,7 @@ from pydantic import BaseModel
 
 from app.services.candidate_service import list_shortlisted_candidates, save_candidate_evaluation
 from app.services.extractor import extract_text_from_pdf
-from app.services.llm_service import evaluate_candidate_fit, extract_structured_resume
+from app.services.llm_service import analyze_candidate_single_pass
 from app.models.resume import CandidateRecord, EvaluationResult, ParsedResume
 
 app = FastAPI(
@@ -67,9 +67,10 @@ async def screen_candidate(
 ) -> dict:
     """
     Process a candidate's resume PDF against a job description.
-    
-    Extracts text, parses it into structured data, evaluates the fit using an LLM,
-    and stores the complete record in MongoDB.
+
+    Extracts raw text then runs a single-pass LLM call that simultaneously
+    parses the resume into structured data AND evaluates the candidate fit.
+    The result is persisted to MongoDB and returned as JSON.
     """
     # 1. Validate file type
     if file.content_type not in ["application/pdf", "text/plain"]:
@@ -77,7 +78,7 @@ async def screen_candidate(
             status_code=400,
             detail="Invalid file type. Only PDF and text files are supported.",
         )
-    
+
     # 2. Extract text from PDF
     try:
         file_bytes = await file.read()
@@ -87,25 +88,20 @@ async def screen_candidate(
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Failed to process PDF: {e}")
 
-    # 3. LLM Pipeline
-    # Pass 1: Parse the resume
-    parsed_resume = await extract_structured_resume(raw_text)
-    
-    # Pass 2: Evaluate the candidate
-    eval_result = await evaluate_candidate_fit(parsed_resume, job_description)
-    
-    # 4. Save to MongoDB
+    # 3. Single-pass LLM: extract + evaluate in one call
+    analysis = await analyze_candidate_single_pass(raw_text, job_description)
+
+    # 4. Persist to MongoDB
     record_id = await save_candidate_evaluation(
         job_description=job_description,
-        parsed=parsed_resume,
-        eval_result=eval_result
+        parsed=analysis.parsed_resume,
+        eval_result=analysis.evaluation,
     )
-    
-    # Return the assembled record pieces
+
     return {
         "candidate_id": record_id,
-        "parsed_resume": parsed_resume.model_dump(),
-        "evaluation": eval_result.model_dump(),
+        "parsed_resume": analysis.parsed_resume.model_dump(),
+        "evaluation": analysis.evaluation.model_dump(),
     }
 
 

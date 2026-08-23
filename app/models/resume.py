@@ -169,3 +169,25 @@ class CandidateRecord(BaseModel):
         ...,
         description="UTC timestamp of when this record was created.",
     )
+
+
+# -- Single-pass LLM output ---------------------------------------------------
+
+
+class CandidateAnalysis(BaseModel):
+    """
+    Combined output of the single-pass LLM pipeline.
+
+    The LLM simultaneously extracts structured resume fields AND evaluates
+    the candidate against the job description in one API call, returning both
+    a `ParsedResume` and an `EvaluationResult` in a single JSON response.
+    """
+
+    parsed_resume: ParsedResume = Field(
+        ...,
+        description="Structured fields extracted from the raw resume text.",
+    )
+    evaluation: EvaluationResult = Field(
+        ...,
+        description="LLM-generated scoring and reasoning against the job description.",
+    )

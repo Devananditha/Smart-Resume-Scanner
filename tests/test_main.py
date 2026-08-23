@@ -55,12 +55,13 @@ class TestScreeningEndpoints:
     """Group: /api/v1/screen and /api/v1/candidates endpoints."""
 
     @patch("app.main.extract_text_from_pdf")
-    @patch("app.main.extract_structured_resume")
-    @patch("app.main.evaluate_candidate_fit")
+    @patch("app.main.analyze_candidate_single_pass")
     @patch("app.main.save_candidate_evaluation")
     def test_screen_candidate_success(
-        self, mock_save, mock_eval, mock_extract_struct, mock_extract_pdf, client: Client
+        self, mock_save, mock_analyze, mock_extract_pdf, client: Client
     ):
+        from app.models.resume import CandidateAnalysis
+
         # Mock responses
         mock_extract_pdf.return_value = "Mock PDF text"
         mock_parsed = ParsedResume(
@@ -70,7 +71,6 @@ class TestScreeningEndpoints:
             experience=[],
             education=[],
         )
-        mock_extract_struct.return_value = mock_parsed
         mock_evaluation = EvaluationResult(
             match_score=9.0,
             justification="Great match",
@@ -78,7 +78,10 @@ class TestScreeningEndpoints:
             missing_skills=[],
             recommendation="Strong Match",
         )
-        mock_eval.return_value = mock_evaluation
+        mock_analyze.return_value = CandidateAnalysis(
+            parsed_resume=mock_parsed,
+            evaluation=mock_evaluation
+        )
         mock_save.return_value = "uuid-1234"
 
         # Make the request
@@ -95,8 +98,7 @@ class TestScreeningEndpoints:
 
         # Assert mocks called
         mock_extract_pdf.assert_called_once()
-        mock_extract_struct.assert_called_once_with("Mock PDF text")
-        mock_eval.assert_called_once_with(mock_parsed, "Need a Python dev")
+        mock_analyze.assert_called_once_with("Mock PDF text", "Need a Python dev")
         mock_save.assert_called_once_with(
             job_description="Need a Python dev",
             parsed=mock_parsed,
