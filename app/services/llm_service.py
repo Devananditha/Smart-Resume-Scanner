@@ -112,6 +112,8 @@ def _call_gemini_single_pass(user_message: str) -> str:
         contents=user_message,
         config=config,
     )
+    if response.text is None:
+        raise RuntimeError("Gemini returned empty response text")
     return response.text
 
 
@@ -146,6 +148,8 @@ async def analyze_candidate_single_pass(
             temperature=0.1,
         )
         text = response.choices[0].message.content
+        if text is None:
+            raise RuntimeError("OpenRouter returned empty content")
         return CandidateAnalysis.model_validate_json(text)
     except Exception as or_exc:
         logger.warning("OpenRouter attempt failed: %s", or_exc)
