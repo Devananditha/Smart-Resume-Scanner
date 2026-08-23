@@ -1,40 +1,33 @@
 """
 app/services/llm_service.py
 ────────────────────────────
-Two-pass LLM pipeline for the Smart Resume Screener, with an automatic Groq
-fallback triggered on Gemini rate-limit (429) or server errors (502/503).
+Single-pass LLM pipeline for the Smart Resume Screener.
 
-Pass 1 — Structured extraction
-    Raw resume text  →  ParsedResume  (JSON mode + Pydantic validation)
+Architecture
+────────────
+Previous design: two sequential API calls (extract → evaluate).
+Current design:  one API call that extracts AND evaluates simultaneously,
+                 halving latency and API round-trips per resume.
 
-Pass 2 — Semantic evaluation
-    ParsedResume + job description  →  EvaluationResult  (JSON mode + Pydantic)
+Provider chain
+──────────────
+1. Primary   — Groq ``llama-3.3-70b-versatile`` (LPU; fast inference)
+               Falls back to ``groq/compound`` if the 70B model is unavailable.
+2. Secondary — Google Gemini ``gemini-3.6-flash`` (used if all Groq calls fail)
 
 Design decisions
 ────────────────
-* `genai.Client` and `groq.Groq` are both instantiated once at module level
-  (singletons) so the underlying HTTP sessions are reused across requests.
+* Both clients are instantiated once at module level (singletons) to reuse
+  the underlying HTTP sessions across concurrent requests.
 
-* `client.models.generate_content` is synchronous (blocking HTTP).  Each call
-  is offloaded to a thread-pool executor via `asyncio.to_thread` to avoid
-  stalling the FastAPI event loop during network I/O.  The same applies to the
-  synchronous Groq client.
+* Both ``_call_groq_single_pass`` and ``_call_gemini_single_pass`` are
+  synchronous (blocking HTTP). Each is dispatched to a thread-pool executor
+  via ``asyncio.to_thread`` to avoid blocking the FastAPI event loop.
 
-* JSON output is enforced via `response_mime_type="application/json"` for Gemini
-  and `response_format={"type": "json_object"}` for Groq, combined with an
-  explicit JSON structure description in the system prompt.
-  `response_schema=<PydanticModel>` is intentionally NOT used for Gemini: in
-  google-genai SDK 2.x, passing a Pydantic model as response_schema activates
-  Automatic Function Calling (AFC), which hangs or errors on
-  `models.generate_content`. Instead, the response text is validated by
-  `model_validate_json()` which gives identical Pydantic enforcement.
-
-* Fallback policy:
-  - If Gemini raises ANY exception (rate-limit, 503 overload, network error)
-    AND a Groq API key is configured, the same prompt is replayed on Groq's
-    `llama3-8b-8192` model.
-  - If Groq also fails, or no Groq key is available, the original exception is
-    re-raised as HTTP 502.
+* JSON output is enforced via ``response_format={"type": "json_object"}``
+  for Groq (where supported) and ``response_mime_type="application/json"``
+  for Gemini.  In both cases the schema is also injected into the system
+  prompt so the model knows exactly which keys to emit.
 
 * All API and JSON-parse failures are caught and re-raised as HTTP 502 so
   the router always returns a well-formed error to the client.
@@ -44,7 +37,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import warnings
 
 from fastapi import HTTPException
 from google import genai
@@ -52,7 +44,7 @@ from google.genai import types
 from groq import Groq
 
 from app.config import settings
-from app.models.resume import EvaluationResult, ParsedResume
+from app.models.resume import CandidateAnalysis
 
 logger = logging.getLogger(__name__)
 
@@ -62,126 +54,145 @@ logger = logging.getLogger(__name__)
 
 _gemini_client = genai.Client(api_key=settings.gemini_api_key)
 
-# Groq client is only functional when a key is configured.
 _groq_client: Groq | None = None
 if settings.groq_api_key:
     _groq_client = Groq(api_key=settings.groq_api_key)
 
-# Primary model identifier.
+# Groq model preference list.
+_GROQ_MODELS = [
+    "llama-3.1-8b-instant",      # Preferred: LPU-accelerated, generous free-tier TPM, supports json_object
+    "groq/compound",             # Groq's routing model (no json_object mode)
+]
+
 _GEMINI_MODEL = "gemini-3.6-flash"
 
-# Fallback model identifier.
-# groq/compound is Groq's own production model with reliable JSON prompt following.
-_GROQ_MODEL = "groq/compound"
-
 # ---------------------------------------------------------------------------
-# JSON schema hints embedded in prompts
-# (used instead of response_schema= to avoid AFC activation in SDK 2.x)
+# Combined JSON schema injected into every system prompt
 # ---------------------------------------------------------------------------
 
-_PARSED_RESUME_SCHEMA = """
+_COMBINED_SCHEMA = """
 {
-  "full_name": "string",
-  "email": "string or null",
-  "phone": "string or null",
-  "skills": ["string"],
-  "experience": [
-    {
-      "company": "string (required — NEVER null. Omit this entry if company name is unknown)",
-      "role": "string (required — NEVER null. Omit this entry if role is unknown)",
-      "duration": "string or null",
-      "highlights": ["string"]
-    }
-  ],
-  "education": [
-    {
-      "institution": "string (required — NEVER null. Omit this entry if institution name is unknown)",
-      "degree": "string (required — NEVER null. Omit this entry if degree is unknown)",
-      "graduation_year": "string or null",
-      "gpa": "string or null"
-    }
-  ],
-  "summary": "string or null"
+  "parsed_resume": {
+    "full_name": "string (required)",
+    "email": "string or null",
+    "phone": "string or null",
+    "skills": ["list of skill strings"],
+    "experience": [
+      {
+        "company": "string — required, NEVER null — omit entire entry if unknown",
+        "role": "string — required, NEVER null — omit entire entry if unknown",
+        "duration": "string or null",
+        "highlights": ["achievement strings"]
+      }
+    ],
+    "education": [
+      {
+        "institution": "string — required, NEVER null — omit entire entry if unknown",
+        "degree": "string — required, NEVER null — omit entire entry if unknown",
+        "graduation_year": "string or null",
+        "gpa": "string or null"
+      }
+    ],
+    "summary": "string or null"
+  },
+  "evaluation": {
+    "match_score": <float 1.0–10.0>,
+    "justification": "string — concise evidence-based reasoning",
+    "matched_skills": ["skills from JD present in resume"],
+    "missing_skills": ["skills from JD absent from resume"],
+    "recommendation": "Strong Match" | "Potential Match" | "Not a Fit"
+  }
 }
 """
 
-_EVALUATION_RESULT_SCHEMA = """
-{
-  "match_score": float between 1.0 and 10.0,
-  "justification": "string",
-  "matched_skills": ["string"],
-  "missing_skills": ["string"],
-  "recommendation": "Strong Match" | "Potential Match" | "Not a Fit"
-}
-"""
+_SYSTEM_PROMPT = (
+    "You are an expert technical recruiter and resume analyst. "
+    "Given a resume and a job description, you must simultaneously:\n"
+    "1. Extract all structured information from the resume.\n"
+    "2. Score and evaluate the candidate's fit against the job description.\n\n"
+    "Return a single JSON object that EXACTLY matches this schema "
+    "(do not add extra keys, do not return null for required string fields):\n"
+    f"{_COMBINED_SCHEMA}\n"
+    "Rules:\n"
+    "- 'recommendation' must be exactly one of: "
+    "\"Strong Match\", \"Potential Match\", or \"Not a Fit\".\n"
+    "- 'match_score' must be a number between 1.0 and 10.0.\n"
+    "- For required sub-fields (company, role, institution, degree): "
+    "if the value cannot be extracted, omit the entire parent object from its list.\n"
+    "Return ONLY valid JSON — no markdown fences, no explanation, no extra keys."
+)
 
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
 
 
-def _call_gemini(
-    contents: types.ContentUnion,
-    config: types.GenerateContentConfig,
-) -> str:
+def _call_groq_single_pass(user_message: str) -> str:
     """
-    Synchronous wrapper around `_gemini_client.models.generate_content`.
+    Attempt to run the single-pass analysis via Groq.
 
-    Extracted as a named function (rather than a lambda) so that
-    `asyncio.to_thread` can reference it cleanly and test mocks can
-    patch it at a single call-site.
+    Tries each model in ``_GROQ_MODELS`` in order.  Uses
+    ``response_format={"type": "json_object"}`` for models that support it;
+    falls back to prompt-only JSON enforcement for ``groq/compound``.
 
     Returns
     -------
     str
-        The raw text of the first response candidate.
+        Raw JSON string from the model.
 
     Raises
     ------
-    Exception
-        Any network, quota, or API error from the Gemini SDK.
-    """
-    response = _gemini_client.models.generate_content(
-        model=_GEMINI_MODEL,
-        contents=contents,
-        config=config,
-    )
-    return response.text
-
-
-def _call_groq(system_prompt: str, user_message: str) -> str:
-    """
-    Synchronous wrapper around the Groq ChatCompletions API.
-
-    Instructs the Groq model to output strict JSON using the
-    `json_object` response format, which is natively supported by
-    llama3-8b-8192.
-
-    Returns
-    -------
-    str
-        The raw JSON string from the model.
-
-    Raises
-    ------
-    Exception
-        Any network or API error from the Groq SDK.
+    RuntimeError
+        If ``_groq_client`` is not configured or all models fail.
     """
     if _groq_client is None:
         raise RuntimeError("Groq client is not configured — GROQ_API_KEY is missing.")
 
-    # Note: response_format={"type": "json_object"} is intentionally omitted here.
-    # Not all Groq-hosted models support forced JSON validation mode.
-    # JSON compliance is enforced via the system prompt instead (same strategy as Gemini).
-    completion = _groq_client.chat.completions.create(
-        model=_GROQ_MODEL,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_message},
-        ],
+    last_exc: Exception | None = None
+    for model in _GROQ_MODELS:
+        try:
+            kwargs: dict = {
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": _SYSTEM_PROMPT},
+                    {"role": "user",   "content": user_message},
+                ],
+                "temperature": 0.1,
+            }
+            # json_object mode is supported by llama models but not groq/compound
+            if model != "groq/compound":
+                kwargs["response_format"] = {"type": "json_object"}
+
+            completion = _groq_client.chat.completions.create(**kwargs)
+            return completion.choices[0].message.content
+        except Exception as exc:
+            logger.warning("Groq model %s failed (%s). Trying next.", model, exc)
+            last_exc = exc
+            continue
+
+    raise RuntimeError(f"All Groq models failed. Last error: {last_exc}")
+
+
+def _call_gemini_single_pass(user_message: str) -> str:
+    """
+    Run the single-pass analysis via Gemini as a fallback.
+
+    Returns
+    -------
+    str
+        Raw JSON string from the model.
+    """
+    config = types.GenerateContentConfig(
+        system_instruction=_SYSTEM_PROMPT,
+        response_mime_type="application/json",
         temperature=0.1,
     )
-    return completion.choices[0].message.content
+    response = _gemini_client.models.generate_content(
+        model=_GEMINI_MODEL,
+        contents=user_message,
+        config=config,
+    )
+    return response.text
 
 
 # ---------------------------------------------------------------------------
@@ -189,144 +200,70 @@ def _call_groq(system_prompt: str, user_message: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-async def extract_structured_resume(raw_text: str) -> ParsedResume:
-    """
-    Pass 1 — convert raw resume text into a validated `ParsedResume` object.
-
-    Attempts Gemini first; falls back to Groq (llama3-8b-8192) automatically
-    on any API failure when a Groq key is configured.
-
-    Parameters
-    ----------
-    raw_text:
-        Plain text extracted from the candidate's PDF (layout-aware).
-
-    Returns
-    -------
-    ParsedResume
-        Validated Pydantic model populated from the LLM's JSON output.
-
-    Raises
-    ------
-    HTTPException (502)
-        If both the Gemini and Groq API calls fail, or the response cannot
-        be parsed into the expected schema.
-    """
-    system_instruction = (
-        "You are an expert HR parser. "
-        "Extract the following raw resume text into a JSON object that strictly "
-        "matches this schema (omit missing optional fields or set them to null):\n"
-        f"{_PARSED_RESUME_SCHEMA}\n"
-        "Return ONLY valid JSON — no markdown, no explanation, no extra keys."
-    )
-
-    gemini_config = types.GenerateContentConfig(
-        system_instruction=system_instruction,
-        response_mime_type="application/json",
-        temperature=0.1,
-    )
-
-    # --- Primary: Gemini ---
-    try:
-        text = await asyncio.to_thread(_call_gemini, raw_text, gemini_config)
-        return ParsedResume.model_validate_json(text)
-    except HTTPException:
-        raise
-    except Exception as gemini_exc:
-        logger.warning(
-            "Gemini failed for extract_structured_resume (%s: %s). "
-            "Falling back to Groq.",
-            type(gemini_exc).__name__,
-            gemini_exc,
-        )
-
-    # --- Fallback: Groq ---
-    try:
-        text = await asyncio.to_thread(_call_groq, system_instruction, raw_text)
-        return ParsedResume.model_validate_json(text)
-    except Exception as groq_exc:
-        logger.error(
-            "Groq fallback also failed for extract_structured_resume: %s", groq_exc
-        )
-        raise HTTPException(
-            status_code=502,
-            detail="LLM Provider Error",
-        ) from groq_exc
-
-
-async def evaluate_candidate_fit(
-    parsed_resume: ParsedResume,
+async def analyze_candidate_single_pass(
+    resume_text: str,
     job_description: str,
-) -> EvaluationResult:
+) -> CandidateAnalysis:
     """
-    Pass 2 — score how well a parsed resume matches a job description.
+    Single-pass LLM pipeline: extract resume fields AND evaluate candidate fit
+    in one API call.
 
-    Attempts Gemini first; falls back to Groq (llama3-8b-8192) automatically
-    on any API failure when a Groq key is configured.
+    Groq is the primary provider (LPU speed).  If all Groq models fail for
+    any reason, the call is transparently retried against Gemini.
 
     Parameters
     ----------
-    parsed_resume:
-        Structured resume data produced by `extract_structured_resume`.
+    resume_text:
+        Plain text extracted from the candidate's PDF (layout-aware).
     job_description:
         Raw job description text provided by the recruiter.
 
     Returns
     -------
-    EvaluationResult
-        Validated Pydantic model containing the match score, justification,
-        matched/missing skills, and hiring recommendation.
+    CandidateAnalysis
+        Validated Pydantic model containing both ``parsed_resume`` and
+        ``evaluation`` fields.
 
     Raises
     ------
     HTTPException (502)
-        If both the Gemini and Groq API calls fail, or the response cannot
-        be parsed into the expected schema.
+        If both Groq and Gemini fail, or the response cannot be parsed into
+        the expected schema.
     """
-    system_instruction = (
-        "Compare the following resume with this job description "
-        "and rate fit on 1-10 with justification. "
-        "Return a JSON object that strictly matches this schema:\n"
-        f"{_EVALUATION_RESULT_SCHEMA}\n"
-        "Return ONLY valid JSON — no markdown, no explanation, no extra keys. "
-        "The 'recommendation' field MUST be exactly one of: "
-        "'Strong Match', 'Potential Match', or 'Not a Fit'."
-    )
-
     user_message = (
-        f"RESUME (JSON):\n{parsed_resume.model_dump_json(indent=2)}\n\n"
+        f"RESUME:\n{resume_text}\n\n"
         f"JOB DESCRIPTION:\n{job_description}"
     )
 
-    gemini_config = types.GenerateContentConfig(
-        system_instruction=system_instruction,
-        response_mime_type="application/json",
-        temperature=0.2,
-    )
+    # ── Primary: Groq with Retry Logic ───────────────────────────────────────
+    last_groq_exc = None
+    for attempt in range(3):
+        try:
+            text = await asyncio.to_thread(_call_groq_single_pass, user_message)
+            return CandidateAnalysis.model_validate_json(text)
+        except HTTPException:
+            raise
+        except Exception as groq_exc:
+            last_groq_exc = groq_exc
+            logger.warning(
+                "Groq attempt %d failed (%s: %s).",
+                attempt + 1,
+                type(groq_exc).__name__,
+                groq_exc,
+            )
+            if attempt < 2:
+                # Wait 4 seconds before retrying (exponential backoff for rate limits)
+                await asyncio.sleep(4)
 
-    # --- Primary: Gemini ---
+    logger.warning("All 3 Groq attempts failed. Falling back to Gemini.")
+
+    # ── Fallback: Gemini ────────────────────────────────────────────────────
     try:
-        text = await asyncio.to_thread(_call_gemini, user_message, gemini_config)
-        return EvaluationResult.model_validate_json(text)
-    except HTTPException:
-        raise
+        text = await asyncio.to_thread(_call_gemini_single_pass, user_message)
+        return CandidateAnalysis.model_validate_json(text)
     except Exception as gemini_exc:
-        logger.warning(
-            "Gemini failed for evaluate_candidate_fit (%s: %s). "
-            "Falling back to Groq.",
-            type(gemini_exc).__name__,
-            gemini_exc,
-        )
-
-    # --- Fallback: Groq ---
-    try:
-        text = await asyncio.to_thread(_call_groq, system_instruction, user_message)
-        return EvaluationResult.model_validate_json(text)
-    except Exception as groq_exc:
-        logger.error(
-            "Groq fallback also failed for evaluate_candidate_fit: %s", groq_exc
-        )
+        logger.error("Gemini fallback also failed: %s", gemini_exc)
         raise HTTPException(
             status_code=502,
             detail="LLM Provider Error",
-        ) from groq_exc
+        ) from gemini_exc

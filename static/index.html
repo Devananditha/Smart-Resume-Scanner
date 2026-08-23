@@ -658,27 +658,38 @@
     let completed = 0;
     const total   = selectedFiles.length;
 
-    /* ── Sequential batch loop ─────────────────────────────────────────── */
-    for (const file of selectedFiles) {
+    /* ── Chunked batch loop (Concurrency: 2) ──────────────────────────── */
+    const CHUNK_SIZE = 2;
+    for (let i = 0; i < total; i += CHUNK_SIZE) {
+      const chunk = selectedFiles.slice(i, i + CHUNK_SIZE);
       const pct = Math.round((completed / total) * 100);
-      setProgress(pct, `Analyzing resume ${completed + 1} of ${total}: ${file.name}`);
+      setProgress(pct, `Analyzing resumes ${i + 1} to ${Math.min(i + CHUNK_SIZE, total)} of ${total}…`);
 
-      try {
-        const fd = new FormData();
-        fd.append('file', file);
-        fd.append('job_description', jd);
+      await Promise.all(chunk.map(async (file) => {
+        try {
+          const fd = new FormData();
+          fd.append('file', file);
+          fd.append('job_description', jd);
 
-        const resp = await fetch('/api/v1/screen', { method: 'POST', body: fd });
-        const data = await resp.json();
+          const resp = await fetch('/api/v1/screen', { method: 'POST', body: fd });
+          const data = await resp.json();
 
-        if (!resp.ok) throw new Error(data.detail || `HTTP ${resp.status}`);
+          if (!resp.ok) throw new Error(data.detail || `HTTP ${resp.status}`);
 
-        logLine(`${file.name} — Score: ${data.evaluation.match_score}/10 (${data.evaluation.recommendation})`, 'ok');
-      } catch (err) {
-        logLine(`${file.name} — Error: ${err.message}`, 'err');
+          logLine(`${file.name} — Score: ${data.evaluation.match_score}/10 (${data.evaluation.recommendation})`, 'ok');
+        } catch (err) {
+          logLine(`${file.name} — Error: ${err.message}`, 'err');
+        } finally {
+          completed++;
+          const currentPct = Math.round((completed / total) * 100);
+          setProgress(currentPct, `Processed ${completed} of ${total}…`);
+        }
+      }));
+
+      // Throttle: wait 2500ms between chunks to avoid rate limits
+      if (i + CHUNK_SIZE < total) {
+        await new Promise(resolve => setTimeout(resolve, 2500));
       }
-
-      completed++;
     }
 
     /* ── Done: fetch ranked leaderboard ────────────────────────────────── */
