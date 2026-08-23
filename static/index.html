@@ -590,8 +590,14 @@
     if (fileInput.files.length) applyFiles(Array.from(fileInput.files));
   });
 
-  function applyFiles(files) {
-    selectedFiles = files;
+  function applyFiles(newFiles) {
+    // Append new files, skipping any already in the list (dedup by name+size)
+    const existing = new Set(selectedFiles.map(f => f.name + f.size));
+    newFiles.forEach(f => {
+      if (!existing.has(f.name + f.size)) selectedFiles.push(f);
+    });
+    // Reset the native input so the same file can be picked again later
+    fileInput.value = '';
     renderFileList();
     checkReady();
   }
@@ -607,15 +613,29 @@
 
     const wrap = document.createElement('div');
     wrap.style.cssText = 'display:flex;flex-direction:column;gap:5px;margin-top:8px;max-height:160px;overflow-y:auto';
-    selectedFiles.forEach(f => {
+
+    selectedFiles.forEach((f, idx) => {
       const tag = document.createElement('div');
       tag.className = 'file-tag';
+      tag.style.justifyContent = 'space-between';
       tag.innerHTML = `
-        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-          <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
-          <polyline points="14 2 14 8 20 8"/>
-        </svg>
-        <span>${escHtml(f.name)}</span>`;
+        <span style="display:flex;align-items:center;gap:8px;overflow:hidden">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="flex-shrink:0">
+            <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+            <polyline points="14 2 14 8 20 8"/>
+          </svg>
+          <span style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${escHtml(f.name)}</span>
+        </span>
+        <button data-idx="${idx}" style="background:none;border:none;color:var(--muted);cursor:pointer;font-size:.9rem;padding:0 2px;line-height:1;flex-shrink:0" title="Remove">&#x2715;</button>`;
+
+      // Remove individual file on click
+      tag.querySelector('button').addEventListener('click', e => {
+        e.stopPropagation();
+        selectedFiles.splice(idx, 1);
+        renderFileList();
+        checkReady();
+      });
+
       wrap.appendChild(tag);
     });
     fileList.appendChild(wrap);
@@ -673,6 +693,11 @@
 
     setProgress(100, `Done — ${total} resume${total > 1 ? 's' : ''} processed.`);
     setLoading(false);
+
+    // Reset file state so the user can start a fresh batch
+    selectedFiles = [];
+    renderFileList();
+    checkReady();
   });
 
   /* ── UI helpers ────────────────────────────────────────────────────────── */
