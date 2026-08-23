@@ -13,6 +13,8 @@ Conventions
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from app.services.candidate_service import list_shortlisted_candidates, save_candidate_evaluation
@@ -36,7 +38,17 @@ app.add_middleware(
 )
 
 
-# ── Liveness probe ────────────────────────────────────────────────────────────
+# Mount static files (frontend)
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
+
+# ── Liveness probe ───────────────────────────────────────────────────────────────────
+
+
+@app.get("/", include_in_schema=False)
+async def serve_frontend() -> FileResponse:
+    """Serve the React-less single-page frontend."""
+    return FileResponse("static/index.html")
 
 
 @app.get("/health", tags=["Health"])
