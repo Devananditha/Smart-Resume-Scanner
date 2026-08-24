@@ -47,6 +47,61 @@ Both providers are configured with `response_format: json_object` and strict Pyd
 
 ---
 
+## LLM Usage & Prompts
+
+This project uses semantic matching and scoring to evaluate candidates. The LLM receives both the resume and job description in a single request and simultaneously extracts structured data and scores candidate fit — eliminating the need for two separate API calls.
+
+### System Prompt
+
+Injected as the `system` role message to set the model's behaviour and enforce output structure:
+
+```
+You are an expert technical recruiter and ATS system. Your task is to compare
+the provided resume text against the job description. You must extract the
+candidate's skills, experience, and education. Rate their fit on a scale of 1-10
+and provide a brief, professional justification for your score. You must return
+your response strictly in valid JSON format matching the required schema.
+```
+
+### User Prompt Payload
+
+Sent as the `user` role message, combining both inputs into a single context window:
+
+```
+RESUME:
+{resume_text}
+
+JOB DESCRIPTION:
+{job_description}
+```
+
+### Output Schema Enforcement
+
+The prompt embeds the full JSON schema blueprint so the model knows exactly what fields to return. Every response is immediately validated against a strict Pydantic model (`CandidateAnalysis`). If validation fails — due to a missing required field, wrong type, or out-of-range score — the pipeline falls through to the next provider rather than returning bad data to the caller.
+
+```json
+{
+  "parsed_resume": {
+    "full_name": "string (required)",
+    "email": "string or null",
+    "phone": "string or null",
+    "skills": ["list of skill strings"],
+    "experience": [{ "company": "string", "role": "string", "duration": "string or null", "highlights": ["..."] }],
+    "education":  [{ "institution": "string", "degree": "string", "graduation_year": "string or null", "gpa": "string or null" }],
+    "summary": "string or null"
+  },
+  "evaluation": {
+    "match_score": "<float 1.0–10.0>",
+    "justification": "string",
+    "matched_skills": ["skills present in both resume and JD"],
+    "missing_skills": ["skills in JD absent from resume"],
+    "recommendation": "Strong Match | Potential Match | Not a Fit"
+  }
+}
+```
+
+---
+
 ## API Reference
 
 ### POST `/api/v1/screen`
