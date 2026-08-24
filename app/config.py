@@ -22,8 +22,8 @@ class Settings(BaseSettings):
     # ── Google Gemini ────────────────────────────────────────────────────────
     gemini_api_key: str
 
-    # ── OpenRouter (Primary LLM provider) ────────────────────────────────────
-    openrouter_api_key: str = ""
+    # ── Groq (Primary LLM provider) ──────────────────────────────────────────
+    groq_api_key: str = ""
 
     # ── MongoDB ──────────────────────────────────────────────────────────────
     mongodb_url: str = "mongodb://localhost:27017"

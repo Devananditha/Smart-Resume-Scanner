@@ -5,14 +5,14 @@ Unit tests for app/services/llm_service.py (single-pass architecture).
 
 Strategy
 ────────
-* The live OpenRouter and Gemini APIs are never called. Tests mock
-  ``openrouter_client.chat.completions.create`` and ``_call_gemini_single_pass``
+* The live Groq and Gemini APIs are never called. Tests mock
+  ``groq_client.chat.completions.create`` and ``_call_gemini_single_pass``
   so asyncio offloading and Pydantic validation are fully exercised while
   the network layer is isolated.
 
 * Tests cover:
-  1. Happy-path OpenRouter success returning a valid CandidateAnalysis.
-  2. OpenRouter failure → Gemini fallback activates and succeeds.
+  1. Happy-path Groq success returning a valid CandidateAnalysis.
+  2. Groq failure → Gemini fallback activates and succeeds.
   3. Both providers fail → HTTPException 502.
   4. Invalid JSON from either provider → HTTPException 502.
 
@@ -75,8 +75,8 @@ def valid_analysis_json() -> str:
     )
 
 
-def mock_openrouter_response(json_string: str) -> MagicMock:
-    """Helper to generate a mock OpenRouter completions response."""
+def mock_groq_response(json_string: str) -> MagicMock:
+    """Helper to generate a mock Groq completions response."""
     mock_resp = MagicMock()
     mock_choice = MagicMock()
     mock_choice.message.content = json_string
@@ -96,16 +96,16 @@ class TestAnalyzeCandidateSinglePass:
 
     @pytest.mark.asyncio
     @patch("app.services.llm_service.asyncio.sleep", new_callable=AsyncMock)
-    async def test_openrouter_success_returns_candidate_analysis(
+    async def test_groq_success_returns_candidate_analysis(
         self, mock_sleep: AsyncMock, valid_analysis_json: str
     ) -> None:
         """
-        When OpenRouter succeeds, the function must return a
+        When Groq succeeds, the function must return a
         fully validated CandidateAnalysis with correct nested fields.
         """
-        mock_resp = mock_openrouter_response(valid_analysis_json)
+        mock_resp = mock_groq_response(valid_analysis_json)
         with patch(
-            "app.services.llm_service.openrouter_client.chat.completions.create",
+            "app.services.llm_service.groq_client.chat.completions.create",
             new_callable=AsyncMock,
             return_value=mock_resp,
         ):
@@ -122,18 +122,18 @@ class TestAnalyzeCandidateSinglePass:
 
     @pytest.mark.asyncio
     @patch("app.services.llm_service.asyncio.sleep", new_callable=AsyncMock)
-    async def test_openrouter_fails_gemini_succeeds(
+    async def test_groq_fails_gemini_succeeds(
         self, mock_sleep: AsyncMock, valid_analysis_json: str
     ) -> None:
         """
-        When OpenRouter raises any exception, it should sleep 2s, then invoke
+        When Groq raises any exception, it should sleep 1s, then invoke
         _call_gemini_single_pass and still return a valid CandidateAnalysis.
         """
         with (
             patch(
-                "app.services.llm_service.openrouter_client.chat.completions.create",
+                "app.services.llm_service.groq_client.chat.completions.create",
                 new_callable=AsyncMock,
-                side_effect=Exception("OpenRouter error"),
+                side_effect=Exception("Groq error"),
             ),
             patch(
                 "app.services.llm_service._call_gemini_single_pass",
@@ -145,20 +145,20 @@ class TestAnalyzeCandidateSinglePass:
         assert isinstance(result, CandidateAnalysis)
         assert result.parsed_resume.full_name == "Alice Chen"
         mock_gemini.assert_called_once()
-        mock_sleep.assert_called_once_with(2)
+        mock_sleep.assert_called_once_with(1)
 
     @pytest.mark.asyncio
     @patch("app.services.llm_service.asyncio.sleep", new_callable=AsyncMock)
     async def test_both_providers_fail_raises_502(self, mock_sleep: AsyncMock) -> None:
         """
-        If both OpenRouter and Gemini raise exceptions, HTTPException 502 must
+        If both Groq and Gemini raise exceptions, HTTPException 502 must
         be raised — raw provider errors must never propagate.
         """
         with (
             patch(
-                "app.services.llm_service.openrouter_client.chat.completions.create",
+                "app.services.llm_service.groq_client.chat.completions.create",
                 new_callable=AsyncMock,
-                side_effect=Exception("OpenRouter overloaded"),
+                side_effect=Exception("Groq rate limited"),
             ),
             patch(
                 "app.services.llm_service._call_gemini_single_pass",
@@ -170,21 +170,21 @@ class TestAnalyzeCandidateSinglePass:
 
         assert exc_info.value.status_code == 502
         assert exc_info.value.detail == "LLM Provider Error"
-        mock_sleep.assert_called_once_with(2)
+        mock_sleep.assert_called_once_with(1)
 
     @pytest.mark.asyncio
     @patch("app.services.llm_service.asyncio.sleep", new_callable=AsyncMock)
-    async def test_invalid_json_from_openrouter_falls_back_to_gemini(
+    async def test_invalid_json_from_groq_falls_back_to_gemini(
         self, mock_sleep: AsyncMock, valid_analysis_json: str
     ) -> None:
         """
-        If OpenRouter returns malformed JSON that fails Pydantic validation,
+        If Groq returns malformed JSON that fails Pydantic validation,
         the Gemini fallback should be triggered and succeed.
         """
-        mock_resp = mock_openrouter_response("{not valid json !!!}")
+        mock_resp = mock_groq_response("{not valid json !!!}")
         with (
             patch(
-                "app.services.llm_service.openrouter_client.chat.completions.create",
+                "app.services.llm_service.groq_client.chat.completions.create",
                 new_callable=AsyncMock,
                 return_value=mock_resp,
             ),
@@ -198,7 +198,7 @@ class TestAnalyzeCandidateSinglePass:
         assert isinstance(result, CandidateAnalysis)
         mock_gemini.assert_called_once()
         # Invalid JSON causes an exception during model_validate_json, so it hits the except block
-        mock_sleep.assert_called_once_with(2)
+        mock_sleep.assert_called_once_with(1)
 
     @pytest.mark.asyncio
     @patch("app.services.llm_service.asyncio.sleep", new_callable=AsyncMock)
@@ -207,10 +207,10 @@ class TestAnalyzeCandidateSinglePass:
         Malformed JSON from both providers must ultimately surface as
         HTTPException 502 — never as a raw ValidationError or JSONDecodeError.
         """
-        mock_resp = mock_openrouter_response("<html>error</html>")
+        mock_resp = mock_groq_response("<html>error</html>")
         with (
             patch(
-                "app.services.llm_service.openrouter_client.chat.completions.create",
+                "app.services.llm_service.groq_client.chat.completions.create",
                 new_callable=AsyncMock,
                 return_value=mock_resp,
             ),
@@ -223,4 +223,4 @@ class TestAnalyzeCandidateSinglePass:
                 await analyze_candidate_single_pass(self.RESUME, self.JD)
 
         assert exc_info.value.status_code == 502
-        mock_sleep.assert_called_once_with(2)
+        mock_sleep.assert_called_once_with(1)
