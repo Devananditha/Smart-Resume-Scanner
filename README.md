@@ -1,158 +1,255 @@
 # Smart Resume Screener
 
-The **Smart Resume Screener** is an AI-powered API that automates the tedious process of parsing applicant resumes and scoring them against a target job description. 
+> An AI-powered resume screening API that automatically parses candidate resumes and scores them against a job description — eliminating manual screening effort at scale.
 
-By leveraging layout-aware PDF extraction and the reasoning capabilities of Gemini 3.6 Flash, this system completely circumvents the hallucinations and structure loss typical of naïve AI wrappers. It provides structured JSON extraction and semantic candidate evaluation with full MongoDB persistence.
+[![Python](https://img.shields.io/badge/Python-3.11+-3776AB?logo=python&logoColor=white)](https://python.org)
+[![FastAPI](https://img.shields.io/badge/FastAPI-0.100+-009688?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com)
+[![MongoDB](https://img.shields.io/badge/MongoDB-Motor-47A248?logo=mongodb&logoColor=white)](https://motor.readthedocs.io)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 ---
 
-## 🏛️ System Architecture
+## Overview
 
-The pipeline consists of a single POST request that orchestrates a multi-step, two-pass LLM workflow, before finally committing the result to a database.
+The Smart Resume Screener accepts a candidate's PDF resume and a job description, then returns a fully structured evaluation in a single API call. It handles the complete screening workflow:
+
+- **PDF Extraction** — Layout-aware text extraction that correctly handles multi-column and visually complex résumé formats.
+- **Structured Parsing** — Extracts name, contact details, skills, experience, and education into a validated JSON model.
+- **Semantic Scoring** — Scores candidate fit (1.0–10.0) against the job description with evidence-based justification.
+- **Persistence** — Persists every evaluation to MongoDB for downstream querying and shortlisting.
+
+---
+
+## Architecture
+
+The pipeline is a **single-pass LLM architecture** — one API call performs extraction and evaluation simultaneously, cutting latency and API round-trips in half.
 
 ```mermaid
 graph TD
-    A[Upload PDF Resume & Job Description] -->|POST /api/v1/screen| B(Layout-Aware Extractor<br/><code>pdfplumber</code>)
-    B --> C{Pass 1: Structured Extraction<br/>Gemini 3.6 Flash}
-    C -->|Strict Pydantic Validation| D(ParsedResume Model)
-    D --> E{Pass 2: Semantic Scoring<br/>Gemini 3.6 Flash}
-    E -->|Strict Pydantic Validation| F(EvaluationResult Model)
-    F --> G[(MongoDB Persistence)]
-    G --> H[Return JSON Evaluation]
+    A[Upload PDF Resume & Job Description] -->|POST /api/v1/screen| B(Layout-Aware Extractor<br><code>pdfplumber</code>)
+    B --> C{Single-Pass LLM<br>Extract + Evaluate}
+    C -->|Primary: Groq allam-2-7b| D(CandidateAnalysis Model)
+    C -->|Fallback: Gemini 3.6 Flash| D
+    D -->|Strict Pydantic Validation| E[(MongoDB Persistence)]
+    E --> F[Return JSON Evaluation]
 ```
 
----
+### LLM Provider Chain
 
-## 🧠 LLM Integration Strategy
+The service uses an automatic provider failover strategy for reliability:
 
-This project solves the "LLM Hallucination" problem by decoupling extraction from evaluation and strictly enforcing Pydantic schemas via prompt-embedded JSON blueprints and `application/json` enforcement, entirely avoiding the buggy Automatic Function Calling (AFC) implementations in newer SDKs.
+| Priority | Provider | Model | Notes |
+|----------|----------|-------|-------|
+| Primary | **Groq** | `allam-2-7b` | Fast 7B model, low token usage, JSON mode enforced |
+| Fallback | **Google Gemini** | `gemini-3.6-flash` | Activates automatically if Groq fails |
 
-### Pass 1: Extraction
-**Goal:** Convert raw, messy PDF text into structured data.
-**Prompt Strategy:**
-> "You are an expert HR parser. Extract the following raw resume text into a JSON object that strictly matches this schema (omit missing optional fields or set them to null)... Return ONLY valid JSON — no markdown, no explanation."
-
-**Schema Enforcement:** The extracted JSON string is immediately passed to `ParsedResume.model_validate_json()`. If Gemini hallucinates a schema mismatch, Pydantic raises an exception, which the router handles gracefully.
-
-### Pass 2: Semantic Evaluation
-**Goal:** Score the candidate and explain the reasoning.
-**Prompt Strategy:**
-> "Compare the following resume with this job description and rate fit on 1-10 with justification. Return a JSON object that strictly matches this schema..."
-
-We pass the `ParsedResume.model_dump_json()` string generated from Pass 1, removing layout noise and ensuring Gemini evaluates the candidate based on concrete, structured attributes rather than raw PDF formatting.
+Both providers are configured with `response_format: json_object` and strict Pydantic schema validation. If a provider returns malformed JSON, the pipeline falls through to the next provider before surfacing a `502` error.
 
 ---
 
-## 🔌 API Reference
+## API Reference
 
-### 1. Screen Candidate
-**`POST /api/v1/screen`**
+### POST `/api/v1/screen`
 
-**Request (multipart/form-data):**
-- `file`: The candidate's resume (PDF or TXT).
-- `job_description`: The text of the job description.
+Processes a candidate's resume against a job description.
 
-**Success Response (200 OK):**
+**Request — `multipart/form-data`**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `file` | `File` | Candidate's resume (`.pdf` or `.txt`) |
+| `job_description` | `string` | Full text of the target job description |
+
+**Response — `200 OK`**
+
 ```json
 {
   "candidate_id": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
   "parsed_resume": {
     "full_name": "Devananditha V",
     "email": "deva@example.com",
-    "phone": null,
+    "phone": "+91-9876543210",
     "skills": ["Python", "FastAPI", "MongoDB", "NLP"],
-    "experience": [...],
-    "education": [...],
-    "summary": null
+    "experience": [
+      {
+        "company": "Tech Corp",
+        "role": "Backend Engineer",
+        "duration": "2022–2024",
+        "highlights": ["Built REST APIs", "Reduced P95 latency by 35%"]
+      }
+    ],
+    "education": [
+      {
+        "institution": "Anna University",
+        "degree": "B.E. Computer Science",
+        "graduation_year": "2022",
+        "gpa": "8.9/10"
+      }
+    ],
+    "summary": "Backend engineer with 2 years of production Python and FastAPI experience."
   },
   "evaluation": {
     "match_score": 8.5,
-    "justification": "The candidate has strong direct experience with Python, FastAPI, and NLP.",
-    "matched_skills": ["Python", "FastAPI"],
-    "missing_skills": [],
+    "justification": "Candidate demonstrates direct experience with Python and FastAPI. NLP background is a strong differentiator. Missing Kubernetes experience required by the JD.",
+    "matched_skills": ["Python", "FastAPI", "MongoDB", "NLP"],
+    "missing_skills": ["Kubernetes"],
     "recommendation": "Strong Match"
   }
 }
 ```
 
-### 2. List Shortlisted Candidates
-**`GET /api/v1/candidates?min_score=7.0`**
+**Error Responses**
 
-**Success Response (200 OK):**
+| Status | Condition |
+|--------|-----------|
+| `400 Bad Request` | Unsupported file type or unreadable PDF |
+| `502 Bad Gateway` | Both LLM providers failed after retry |
+
+---
+
+### GET `/api/v1/candidates`
+
+Retrieves previously evaluated candidates from MongoDB, filtered by minimum match score.
+
+**Query Parameters**
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `min_score` | `float` | `0.0` | Minimum `match_score` threshold (1.0–10.0) |
+
+**Response — `200 OK`**
+
+Returns an array of candidate records sorted by `match_score` descending.
+
 ```json
 [
   {
-    "job_description": "...",
-    "parsed_resume": {...},
-    "evaluation": {...},
-    "created_at": "2026-08-22T02:00:00Z",
-    "id": "f47ac10b-58cc-4372-a567-0e02b2c3d479"
+    "id": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
+    "job_description": "Looking for a backend engineer with FastAPI experience...",
+    "parsed_resume": { "..." },
+    "evaluation": { "match_score": 8.5, "recommendation": "Strong Match", "..." },
+    "created_at": "2026-08-24T08:30:00Z"
   }
 ]
 ```
 
 ---
 
-## 🚀 Local Setup & Execution
+## Local Setup
 
 ### Prerequisites
-- Python 3.11+
-- A running local instance of MongoDB (default port `27017`)
-- A Google Gemini API Key
 
-### 1. Environment Setup
-Create a virtual environment and install dependencies:
+- Python **3.11+**
+- MongoDB running locally on default port `27017`
+- A **Groq** API key → [console.groq.com](https://console.groq.com) *(free, no credit card)*
+- A **Gemini** API key → [aistudio.google.com/apikey](https://aistudio.google.com/apikey) *(free, 1,500 req/day)*
+
+---
+
+### 1. Clone the Repository
+
+```bash
+git clone https://github.com/Devananditha/Smart-Resume-Scanner.git
+cd Smart-Resume-Scanner
+```
+
+### 2. Create a Virtual Environment
+
 ```powershell
 python -m venv .venv
-.\.venv\Scripts\activate
+.\.venv\Scripts\activate        # Windows
+# source .venv/bin/activate     # macOS / Linux
 pip install -r requirements.txt
 ```
 
-### 2. Configuration
-Create a `.env` file in the root directory:
+### 3. Configure Environment Variables
+
+Copy the example file and populate it with your keys:
+
+```powershell
+copy .env.example .env
+```
+
+Edit `.env`:
+
 ```env
-GEMINI_API_KEY=your_gemini_api_key_here
+# Primary LLM — Groq (free at console.groq.com)
+GROQ_API_KEY=gsk_...
+
+# Fallback LLM — Google Gemini (free at aistudio.google.com/apikey)
+GEMINI_API_KEY=AQ....
+
+# MongoDB
 MONGODB_URL=mongodb://localhost:27017
 DATABASE_NAME=resume_screener
 ```
 
-### 3. Running the Server
-Start the FastAPI server via Uvicorn:
+### 4. Start the Server
+
 ```powershell
 uvicorn app.main:app --reload
 ```
-The API is now running at `http://127.0.0.1:8000`. 
-Access the auto-generated Swagger UI at `http://127.0.0.1:8000/docs`.
+
+| Endpoint | URL |
+|----------|-----|
+| API Base | `http://127.0.0.1:8000` |
+| Swagger UI | `http://127.0.0.1:8000/docs` |
+| ReDoc | `http://127.0.0.1:8000/redoc` |
+| Health Check | `http://127.0.0.1:8000/health` |
 
 ---
 
-## 🧪 Testing
+## Running Tests
 
-The repository includes a comprehensive 49-test `pytest` suite covering schema validation, layout-aware PDF extraction logic, API failure handling, and route orchestration using mocked services.
+The test suite covers Pydantic schema validation, layout-aware PDF extraction, LLM provider failover logic, and full API route orchestration using mocked services.
 
-To run the test suite:
 ```powershell
 pytest -v
 ```
 
+Expected output:
+
+```
+45 passed in 0.21s
+```
+
 ---
 
-## 🎬 Demo Walkthrough Script (2-3 Minutes)
+## Project Structure
 
-Here is a recommended script for recording a video demonstration of this project:
+```
+Smart-Resume-Scanner/
+├── app/
+│   ├── main.py                  # FastAPI app factory & route definitions
+│   ├── config.py                # Pydantic settings (loaded from .env)
+│   ├── database.py              # Motor async MongoDB client
+│   ├── models/
+│   │   └── resume.py            # Pydantic schemas: ParsedResume, EvaluationResult, CandidateAnalysis
+│   └── services/
+│       ├── llm_service.py       # Single-pass LLM pipeline (Groq primary, Gemini fallback)
+│       ├── extractor.py         # Layout-aware PDF extraction via pdfplumber
+│       └── candidate_service.py # MongoDB read/write operations
+├── static/                      # Frontend assets (served at /)
+├── tests/                       # pytest test suite (45 tests)
+├── .env.example                 # Environment variable template
+├── requirements.txt             # Python dependencies
+└── README.md
+```
 
-- **Start (0:00 - 0:30):** 
-  - Briefly introduce the Smart Resume Screener and its purpose (automating HR screening).
-  - Show the terminal, start the server (`uvicorn app.main:app --reload`), and open the Swagger UI (`http://127.0.0.1:8000/docs`).
-- **Extraction & Evaluation (0:30 - 1:30):** 
-  - Expand the `POST /api/v1/screen` endpoint.
-  - Click "Try it out". Upload a complex, multi-column PDF (like the classic Deedy CV).
-  - Paste an example job description (e.g., "Looking for a backend dev with FastAPI experience").
-  - Execute the request and wait for the response.
-- **Reviewing Results (1:30 - 2:00):**
-  - Scroll through the JSON response. Point out how cleanly the `ParsedResume` block extracted education and skills, ignoring the complex visual layout of the PDF.
-  - Highlight the `EvaluationResult` block. Read the `justification` aloud to prove the LLM didn't just keyword match, but actively reasoned about the candidate's fit. Show the score and recommendation.
-- **Database Persistence (2:00 - 2:30):**
-  - Expand the `GET /api/v1/candidates` endpoint.
-  - Set the `min_score` parameter to `7.0` and execute.
-  - Show that the candidate we just evaluated is returned, proving the data was successfully persisted to MongoDB.
+---
+
+## Key Design Decisions
+
+**Single-pass LLM architecture** — Rather than separate API calls for extraction and evaluation, both tasks are performed in one prompt. This halves API latency and round-trips while reducing cost.
+
+**Strict schema enforcement** — Every LLM response is validated against a Pydantic model (`CandidateAnalysis`) immediately after receipt. Schema mismatches are caught at the boundary and trigger provider fallback rather than propagating as bad data.
+
+**Layout-aware PDF extraction** — `pdfplumber` with `layout=True` uses character X/Y coordinates to reconstruct visual reading order. This is critical for multi-column résumé formats where naïve extraction interleaves left- and right-column text.
+
+**Provider failover** — The service degrades gracefully: Groq → Gemini → `502`. No single point of failure at the LLM layer.
+
+---
+
+## License
+
+Distributed under the [MIT License](LICENSE).
