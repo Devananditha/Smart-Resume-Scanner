@@ -6,7 +6,7 @@
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.100+-009688?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com)
 [![MongoDB](https://img.shields.io/badge/MongoDB-Motor-47A248?logo=mongodb&logoColor=white)](https://motor.readthedocs.io)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-
+[![Demo Video](https://img.shields.io/badge/🎥_Watch_Demo_Video-blue?style=for-the-badge)](https://drive.google.com/file/d/1naPnpmjcxyVcMk293OgaRokaLlAqiMCh/view?usp=sharing)
 ---
 
 ## Overview
@@ -314,4 +314,4 @@ Distributed under the [MIT License](LICENSE).
 ## Deliverables & Compliance
 - [x] **Source Code:** Hosted on the public `main` branch.
 - [x] **Clean Repository:** No `.env`, `__pycache__`, or bloated dependencies committed.
-- [x] **Demo Video:** [Insert your 2-3 minute demo video link here]
+- [x] **Demo Video:** [Watch the 2-3 minute demo video here](https://drive.google.com/file/d/1naPnpmjcxyVcMk293OgaRokaLlAqiMCh/view?usp=sharing)
