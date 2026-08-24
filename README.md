@@ -308,3 +308,10 @@ Smart-Resume-Scanner/
 ## License
 
 Distributed under the [MIT License](LICENSE).
+
+---
+
+## Deliverables & Compliance
+- [x] **Source Code:** Hosted on the public `main` branch.
+- [x] **Clean Repository:** No `.env`, `__pycache__`, or bloated dependencies committed.
+- [x] **Demo Video:** [Insert your 2-3 minute demo video link here]
